@@ -545,4 +545,22 @@ try {
 
 ## License
 
-MIT
+[MIT](LICENSE) — the SDK is free to embed in your own applications. It talks to the
+official [dosya.dev](https://dosya.dev) service.
+
+## Security
+
+Found a vulnerability? Please report it privately via
+[GitHub private vulnerability reporting](../../security/advisories/new) rather than a
+public issue.
+
+## The dosya.dev client family
+
+| Repository | What it is | License |
+|---|---|---|
+| [desktop](https://github.com/dosya-dev/desktop) | Desktop client — sync, upload, manage | Source-available |
+| [cli](https://github.com/dosya-dev/cli) | Command-line interface | Source-available |
+| [app.dosya.dev](https://github.com/dosya-dev/app.dosya.dev) | Web application | Source-available |
+| [shared](https://github.com/dosya-dev/shared) | Shared TypeScript types & utilities | Source-available |
+| [dosya-js](https://github.com/dosya-dev/dosya-js) | Official JavaScript SDK | MIT |
+| [dosya-java](https://github.com/dosya-dev/dosya-java) | Official Java SDK | MIT |
