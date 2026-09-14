@@ -1,7 +1,7 @@
 {
   "name": "dosyadev",
-  "version": "0.1.0",
-  "description": "Official JavaScript SDK for dosya.dev — file storage, uploads, sharing, and management",
+  "version": "0.2.0",
+  "description": "Official JavaScript SDK for dosya.dev - file storage, uploads, sharing, webhooks and workspace management",
   "type": "module",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
@@ -16,10 +16,24 @@
         "types": "./dist/index.d.cts",
         "default": "./dist/index.cjs"
       }
-    }
+    },
+    "./webhooks": {
+      "import": {
+        "types": "./dist/webhooks.d.ts",
+        "default": "./dist/webhooks.js"
+      },
+      "require": {
+        "types": "./dist/webhooks.d.cts",
+        "default": "./dist/webhooks.cjs"
+      }
+    },
+    "./package.json": "./package.json"
   },
   "files": [
-    "dist"
+    "dist",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
   ],
   "sideEffects": false,
   "engines": {
@@ -28,17 +42,23 @@
   "scripts": {
     "build": "tsup",
     "dev": "tsup --watch",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json",
+    "test": "vitest run",
+    "test:unit": "vitest run tests/unit",
+    "test:integration": "vitest run tests/integration",
+    "test:watch": "vitest",
+    "prepublishOnly": "npm run typecheck && npm run build && npm run test:unit"
   },
   "keywords": [
+    "api-client",
+    "cloud-storage",
     "dosya",
-    "dosyadev",
     "dosya.dev",
+    "dosyadev",
     "file-storage",
     "file-upload",
-    "cloud-storage",
     "sdk",
-    "api-client"
+    "webhooks"
   ],
   "author": "dosya.dev",
   "license": "MIT",
@@ -51,7 +71,9 @@
     "url": "https://github.com/dosya-dev/dosya-js/issues"
   },
   "devDependencies": {
+    "dotenv": "^17.4.2",
     "tsup": "^8.0.0",
-    "typescript": "^5.7.0"
+    "typescript": "^5.7.0",
+    "vitest": "^3.2.4"
   }
 }
