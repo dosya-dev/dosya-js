@@ -518,15 +518,18 @@ export class UploadResource {
         // A dropped connection, a timeout or an edge 5xx may hide a commit that
         // happened (or is still happening). Re-sending would store the bytes
         // again as a new version, so learn the session's outcome first.
-        if (!isPreHandlerRefusal(err)) {
-          await this.settleBeforeRetry(session.sessionId, err, signal);
-        }
+        const settled = isPreHandlerRefusal(err)
+          ? null
+          : await this.settleBeforeRetry(session.sessionId, err, false, signal);
 
-        // The server marks a session failed (or leaves it uploading) once a PUT
-        // has started, so the same session would answer 409: open a new one.
         await this.http.sleep(delay, signal);
-        onProgress?.(progress(0, size, "initializing"));
-        session = await this.init(initParams);
+        // A session still `pending` never saw the PUT, so it can take it again.
+        // Once a PUT has started the server marks the session failed, which
+        // answers 409: open a new one.
+        if (settled?.status !== "pending") {
+          onProgress?.(progress(0, size, "initializing"));
+          session = await this.init(initParams);
+        }
       }
     }
   }
@@ -588,7 +591,11 @@ export class UploadResource {
       // etags make the session impossible to complete - so a session with no
       // parts yet gets its first part alone.
       if (uploaded.size === 0 && queue.length > 0) {
-        await send(queue[0], bytesOf(queue[0]));
+        const first = queue[0];
+        await this.firstPartWithRetry(sessionId, first, bytesOf(first), signal);
+        uploaded.add(first);
+        bytesDone += partLength(first);
+        emit("uploading");
         queue = queue.slice(1);
       }
       await runPool(queue, job.concurrency, (n) => send(n, bytesOf(n)));
@@ -627,6 +634,55 @@ export class UploadResource {
     }
   }
 
+  /**
+   * The first part of a fresh session, retried without reopening the race it
+   * exists to avoid: an attempt whose response was lost may still be creating
+   * the storage multipart upload, and a retry arriving before that is recorded
+   * would create a second one. Before each retry, wait until the server shows
+   * the part stored (done), or the multipart upload recorded (a retry now
+   * reuses it), or polling runs out.
+   */
+  private async firstPartWithRetry(
+    sessionId: string,
+    partNumber: number,
+    bytes: UploadBatchSource,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const polls = 6;
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await this.uploadPart(sessionId, partNumber, bytes, { abortSignal: signal });
+        return;
+      } catch (err) {
+        if (signal?.aborted) throw err;
+        const delay = this.retryDelay(err, attempt);
+        if (delay === null) {
+          throw new DosyaUploadError(
+            `Failed to upload part ${partNumber}: ${err instanceof Error ? err.message : String(err)}`,
+            sessionId,
+            partNumber,
+            { cause: err },
+          );
+        }
+        if (!isPreHandlerRefusal(err)) {
+          for (let i = 0; i <= polls; i++) {
+            let st: UploadStatusResponse;
+            try {
+              st = await this.status(sessionId, { abortSignal: signal });
+            } catch (statusErr) {
+              if (signal?.aborted) throw statusErr;
+              break;
+            }
+            if (st.uploadedParts.includes(partNumber)) return;
+            if (st.hasMultipart || (st.status !== "uploading" && st.status !== "pending")) break;
+            if (i < polls) await this.http.sleep(this.http.backoff(i), signal);
+          }
+        }
+        await this.http.sleep(delay, signal);
+      }
+    }
+  }
+
   private async completeWithRetry(sessionId: string, options: UploadCompleteOptions): Promise<UploadResult> {
     for (let attempt = 0; ; attempt++) {
       try {
@@ -648,10 +704,12 @@ export class UploadResource {
         }
         const delay = this.retryDelay(err, attempt);
         if (delay === null) throw err;
-        // Only repeat complete once the first attempt is known to have ended
-        // without finishing; a racing second complete can fail a finished session.
+        // Give an attempt that may still be running time to finish before
+        // repeating it: a racing second complete can fail a finished session. A
+        // session with parts reads `uploading` until complete commits, so after
+        // polling it is retried.
         if (!isPreHandlerRefusal(err)) {
-          await this.settleBeforeRetry(sessionId, err, options.abortSignal);
+          await this.settleBeforeRetry(sessionId, err, true, options.abortSignal);
         }
         await this.http.sleep(delay, options.abortSignal);
       }
@@ -660,12 +718,18 @@ export class UploadResource {
 
   /**
    * Wait until the server has finished handling an attempt whose outcome the
-   * client could not see, then decide whether repeating it is safe.
-   * Returns when the session did not complete; throws when it did (the file
-   * exists), when it is still being processed after polling, or when its state
-   * cannot be read - in each case a retry could store the file twice.
+   * client could not see, and return the session's status. Throws when it
+   * completed (the file exists) or when its state cannot be read. A session
+   * still `uploading` after polling throws for a single-request upload (the PUT
+   * may still be storing the file) but is returned for `complete`, because a
+   * multipart session reads `uploading` from its first part until it commits.
    */
-  private async settleBeforeRetry(sessionId: string, cause: unknown, signal?: AbortSignal): Promise<void> {
+  private async settleBeforeRetry(
+    sessionId: string,
+    cause: unknown,
+    forComplete: boolean,
+    signal?: AbortSignal,
+  ): Promise<UploadStatusResponse> {
     const polls = 6;
     for (let i = 0; ; i++) {
       let st: UploadStatusResponse;
@@ -688,8 +752,9 @@ export class UploadResource {
           { cause },
         );
       }
-      if (st.status !== "uploading") return;
+      if (st.status !== "uploading") return st;
       if (i >= polls) {
+        if (forComplete) return st;
         throw new DosyaUploadError(
           "The server is still processing an earlier attempt; not retrying to avoid storing the file twice",
           sessionId,

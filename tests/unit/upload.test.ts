@@ -241,6 +241,22 @@ describe("upload.file() single request", () => {
     expect(api.calls.filter((c) => c.path === "/api/upload/init")).toHaveLength(1);
   });
 
+  it("reuses a session that never saw the failed PUT", async () => {
+    let put = 0;
+    const api = mockApi({
+      "POST /api/upload/init": singleInit("upl_1", 5),
+      "PUT /api/upload/upl_1": () => {
+        if (put++ === 0) throw new TypeError("fetch failed");
+        return ok({ file: fileRow() }, 201);
+      },
+      "GET /api/upload/upl_1/status": singleStatus("upl_1", "pending"),
+    });
+    const result = await new UploadResource(api.http({ retry: RETRY })).file({ workspaceId: "ws_1", fileName: "a.txt", body: bytes(5) });
+    expect(result.sessionId).toBe("upl_1");
+    expect(api.calls.filter((c) => c.path === "/api/upload/init")).toHaveLength(1);
+    expect(api.calls.filter((c) => c.method === "PUT")).toHaveLength(2);
+  });
+
   it("does not re-send when the outcome cannot be read", async () => {
     const api = mockApi({
       "POST /api/upload/init": singleInit("upl_1", 5),
@@ -428,6 +444,56 @@ describe("upload.file() multipart", () => {
     expect(err).toBeInstanceOf(DosyaUploadError);
     expect(err.message).toMatch(/id is unknown/);
     expect(api.calls.filter((c) => c.path.endsWith("/complete"))).toHaveLength(1);
+  });
+
+  const mpStatus = (status: string, parts: number[], hasMultipart: boolean) =>
+    ok({
+      session_id: "upl_m", status, size_bytes: 8, part_size: 4, total_parts: 2,
+      bytes_uploaded: parts.length * 4, uploaded_parts: parts, has_multipart: hasMultipart,
+    });
+
+  it("retries complete when the session still reads uploading after polling", async () => {
+    const api = mockApi({
+      "POST /api/upload/init": multipartInit("upl_m", 8, 4),
+      ...partRoutes("upl_m", 2),
+      "POST /api/upload/upl_m/complete": [fail(502, "Bad gateway"), ok({ file: fileRow() }, 201)],
+      "GET /api/upload/upl_m/status": mpStatus("uploading", [1, 2], true),
+    });
+    const result = await new UploadResource(api.http({ retry: RETRY })).file({ workspaceId: "ws_1", fileName: "big.bin", body: bytes(8) });
+    expect(result.file.id).toBe("file_1");
+    expect(api.calls.filter((c) => c.path.endsWith("/complete"))).toHaveLength(2);
+    expect(api.calls.filter((c) => c.path.endsWith("/status"))).toHaveLength(7);
+  });
+
+  it("does not resend a first part whose lost response was stored", async () => {
+    let first = 0;
+    const api = mockApi({
+      "POST /api/upload/init": multipartInit("upl_m", 8, 4),
+      ...partRoutes("upl_m", 2, (n) => {
+        if (n === 1 && first++ === 0) throw new TypeError("fetch failed");
+        return ok({ part_number: n, etag: `e${n}` }, 201);
+      }),
+      "GET /api/upload/upl_m/status": mpStatus("uploading", [1], true),
+      "POST /api/upload/upl_m/complete": ok({ file: fileRow() }, 201),
+    });
+    await new UploadResource(api.http({ retry: RETRY })).file({ workspaceId: "ws_1", fileName: "big.bin", body: bytes(8) });
+    expect(api.calls.filter((c) => c.path.endsWith("/part/1"))).toHaveLength(1);
+    expect(api.calls.filter((c) => c.path.endsWith("/part/2"))).toHaveLength(1);
+  });
+
+  it("retries the first part once the multipart upload is recorded", async () => {
+    let first = 0;
+    const api = mockApi({
+      "POST /api/upload/init": multipartInit("upl_m", 8, 4),
+      ...partRoutes("upl_m", 2, (n) =>
+        n === 1 && first++ === 0 ? fail(502, "Bad gateway") : ok({ part_number: n, etag: `e${n}` }, 201),
+      ),
+      "GET /api/upload/upl_m/status": mpStatus("uploading", [], true),
+      "POST /api/upload/upl_m/complete": ok({ file: fileRow() }, 201),
+    });
+    await new UploadResource(api.http({ retry: RETRY })).file({ workspaceId: "ws_1", fileName: "big.bin", body: bytes(8) });
+    expect(api.calls.filter((c) => c.path.endsWith("/part/1"))).toHaveLength(2);
+    expect(api.calls.filter((c) => c.path.endsWith("/status"))).toHaveLength(1);
   });
 
   it("reads a stream part by part", async () => {
