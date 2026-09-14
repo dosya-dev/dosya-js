@@ -65,6 +65,11 @@ export class FileRequestsResource {
    * empty patch, 403 `folder_locked` when moving into a locked folder.
    */
   async update(requestId: string, params: UpdateFileRequestParams): Promise<void> {
+    // A blank password would be read as "remove the password" and silently make
+    // the upload page public; `""` is the explicit way to do that.
+    if (typeof params.password === "string" && params.password !== "" && params.password.trim() === "") {
+      throw new TypeError('Password must not be blank; pass "" to remove it');
+    }
     await this.http.request({
       method: "PATCH",
       path: `/api/file-requests/${seg(requestId)}`,

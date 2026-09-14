@@ -11,8 +11,9 @@ export class ActivityResource {
 
   /**
    * One page of the workspace activity log, newest first. `category`, `action`
-   * and `userId` accept a value or a list. Needs the `view_activity` permission;
-   * folder-confined members are refused.
+   * and `userId` accept a value or a list. Needs the `view_activity` permission.
+   * Unknown categories are ignored; if every category given is unknown, no
+   * category filter applies.
    */
   async list(params: ListActivityParams): Promise<ActivityListResponse> {
     return this.http.request({

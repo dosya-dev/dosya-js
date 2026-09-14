@@ -174,8 +174,9 @@ export class WorkspacesResource {
    *
    * By design an API key cannot delete a workspace unattended: someone has to
    * read the code from the owner's inbox. Errors: 400 name mismatch / members
-   * remain / last workspace / missing code, 401 wrong or expired code, 429 code
-   * burned after 5 attempts, 403 not the owner. Resolves `{pending: true,
+   * remain / last workspace / missing code, 401 wrong or expired code (the 5th
+   * wrong attempt burns the code and later calls answer 401 "expired" - call
+   * `requestDeletion` again), 403 not the owner. Resolves `{pending: true,
    * operationId}` when the deletion continues in the background (HTTP 202).
    */
   async delete(workspaceId: string, params: DeleteWorkspaceParams): Promise<DeleteWorkspaceResult> {

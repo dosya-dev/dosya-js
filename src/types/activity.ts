@@ -23,7 +23,7 @@ export interface ActivityEntry {
   /** Null when the caller cannot open the item. */
   resourceName: string | null;
   createdAt: number;
-  /** Null for system actors. */
+  /** Null for system actors and for actors whose account no longer exists (see `actorId`). */
   userId: string | null;
   userName: string | null;
   userEmail: string | null;

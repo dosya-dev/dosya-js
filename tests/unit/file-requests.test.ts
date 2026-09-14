@@ -160,3 +160,13 @@ describe("FileRequestsResource", () => {
     expect(api.calls[0].body).toEqual({ recipient_id: "frr_1" });
   });
 });
+
+describe("fileRequests.update password guard", () => {
+  it("refuses a blank password instead of silently removing it", async () => {
+    const { mockApi } = await import("./_mock.js");
+    const { FileRequestsResource } = await import("../../src/resources/file-requests.js");
+    const api = mockApi({});
+    await expect(new FileRequestsResource(api.http()).update("req_1", { password: "   " })).rejects.toThrow(TypeError);
+    expect(api.calls).toHaveLength(0);
+  });
+});
