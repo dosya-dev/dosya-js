@@ -1,9 +1,33 @@
-import type { HttpClient } from "../http.js";
-import type { CreateFileRequestParams, FileRequestDetail } from "../types.js";
+import { seg, type HttpClient } from "../http.js";
+import type {
+  CreateFileRequestParams,
+  FileRequestListItem,
+  FileRequestRecipient,
+  FileRequestWithActivity,
+  UpdateFileRequestParams,
+} from "../types/file-requests.js";
 
+/**
+ * Upload requests: public pages where anyone with the link can upload into a
+ * workspace folder.
+ *
+ * Key scope: GET needs `read` or `full`, the rest `full`; `upload` keys cannot
+ * call these. Workspace-pinned keys can only call `list()` (for their own
+ * workspace); every other method is refused for them (403). dosya.dev recipient
+ * addresses are refused (400) unless the caller is a dosya.dev account.
+ */
 export class FileRequestsResource {
   constructor(private readonly http: HttpClient) {}
 
+  /** Every request in a workspace (a confined member sees only their folder's). */
+  async list(workspaceId: string): Promise<{ requests: FileRequestListItem[] }> {
+    return this.http.request({ method: "GET", path: "/api/file-requests", query: { workspaceId } });
+  }
+
+  /**
+   * Create a request and email it to `emails`. 404 when the folder is missing or
+   * hidden, 403 `folder_locked` when it is fully locked.
+   */
   async create(params: CreateFileRequestParams): Promise<{
     request: {
       id: string;
@@ -31,69 +55,88 @@ export class FileRequestsResource {
     });
   }
 
-  async get(requestId: string): Promise<{ request: FileRequestDetail }> {
-    return this.http.request({
-      method: "GET",
-      path: `/api/file-requests/${requestId}`,
-    });
+  /** One request with its uploads and recipients. 404 when unknown. */
+  async get(requestId: string): Promise<FileRequestWithActivity> {
+    return this.http.request({ method: "GET", path: `/api/file-requests/${seg(requestId)}/uploads` });
   }
 
-  async update(
-    requestId: string,
-    params: { title?: string; message?: string },
-  ): Promise<void> {
+  /**
+   * Edit a request; only the fields given change. 400 "Nothing to update" for an
+   * empty patch, 403 `folder_locked` when moving into a locked folder.
+   */
+  async update(requestId: string, params: UpdateFileRequestParams): Promise<void> {
+    // A blank password would be read as "remove the password" and silently make
+    // the upload page public; `""` is the explicit way to do that.
+    if (typeof params.password === "string" && params.password !== "" && params.password.trim() === "") {
+      throw new TypeError('Password must not be blank; pass "" to remove it');
+    }
     await this.http.request({
-      method: "PUT",
-      path: `/api/file-requests/${requestId}`,
-      body: { title: params.title, message: params.message },
+      method: "PATCH",
+      path: `/api/file-requests/${seg(requestId)}`,
+      body: {
+        title: params.title,
+        message: params.message,
+        expiresInDays: params.expiresInDays,
+        password: params.password,
+        folderId: params.folderId,
+        allowedExtensions: params.allowedExtensions,
+        maxFileSizeMb: params.maxFileSizeMb,
+        maxFiles: params.maxFiles,
+      },
     });
   }
 
+  /** Revoke a request (its page stops accepting uploads) and notify recipients. */
   async delete(requestId: string): Promise<void> {
+    // Not retried: a repeated DELETE notifies every recipient again.
+    await this.http.request({ method: "DELETE", path: `/api/file-requests/${seg(requestId)}`, retry: "never" });
+  }
+
+  /** Files uploaded through a request, with the request and its recipients. */
+  async listUploads(requestId: string): Promise<FileRequestWithActivity> {
+    return this.get(requestId);
+  }
+
+  /** Invited addresses, oldest first, with their personal upload tokens. */
+  async listRecipients(requestId: string): Promise<{
+    recipients: FileRequestRecipient[];
+    title: string | null;
+    requestToken: string;
+  }> {
+    return this.http.request({ method: "GET", path: `/api/file-requests/${seg(requestId)}/recipients` });
+  }
+
+  /**
+   * Invite one more address and email it. 409 when already a recipient, 410 when
+   * the request is revoked.
+   */
+  async addRecipient(requestId: string, email: string): Promise<{ id: string }> {
+    return this.http.request({
+      method: "POST",
+      path: `/api/file-requests/${seg(requestId)}/recipients`,
+      body: { email },
+    });
+  }
+
+  /** Remove a recipient. Succeeds when already gone. */
+  async removeRecipient(requestId: string, recipientId: string): Promise<void> {
+    seg(recipientId); // validates: an empty id would otherwise be dropped from the query
     await this.http.request({
       method: "DELETE",
-      path: `/api/file-requests/${requestId}`,
+      path: `/api/file-requests/${seg(requestId)}/recipients`,
+      query: { recipientId },
     });
   }
 
-  async listUploads(requestId: string): Promise<{
-    uploads: Array<{
-      id: string;
-      fileName: string;
-      sizeBytes: number;
-      mimeType: string;
-      uploadedAt: number;
-      uploaderEmail: string | null;
-    }>;
-  }> {
-    return this.http.request({
-      method: "GET",
-      path: `/api/file-requests/${requestId}/uploads`,
-    });
-  }
-
-  async listRecipients(requestId: string): Promise<{
-    recipients: Array<{
-      id: string;
-      email: string;
-      status: string;
-      sentAt: number;
-    }>;
-  }> {
-    return this.http.request({
-      method: "GET",
-      path: `/api/file-requests/${requestId}/recipients`,
-    });
-  }
-
-  async resend(
-    requestId: string,
-    recipientIds?: string[],
-  ): Promise<void> {
+  /**
+   * Email the request to one recipient again. 404 when the request is revoked or
+   * the recipient unknown; 500 when the email could not be sent.
+   */
+  async resend(requestId: string, recipientId: string): Promise<void> {
     await this.http.request({
       method: "POST",
-      path: `/api/file-requests/${requestId}/resend`,
-      body: { recipientIds },
+      path: `/api/file-requests/${seg(requestId)}/resend`,
+      body: { recipientId },
     });
   }
 }

@@ -1,6 +1,6 @@
 # dosyadev
 
-Official JavaScript/TypeScript SDK for [dosya.dev](https://dosya.dev) — file storage, chunked uploads, sharing, and workspace management.
+Official JavaScript/TypeScript SDK for [dosya.dev](https://dosya.dev) - file storage, resumable uploads, sharing, webhooks and workspace management.
 
 [![npm version](https://img.shields.io/npm/v/dosyadev.svg)](https://www.npmjs.com/package/dosyadev)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
@@ -11,541 +11,251 @@ Official JavaScript/TypeScript SDK for [dosya.dev](https://dosya.dev) — file s
 npm install dosyadev
 ```
 
-## Quick Start
+Zero runtime dependencies. Works in Node.js 18+, Deno, Bun, Cloudflare Workers and modern browsers.
+
+## Quick start
 
 ```typescript
 import { DosyaClient } from "dosyadev";
 
-const client = new DosyaClient({ apiKey: "dos_your_api_key" });
+const client = new DosyaClient({ apiKey: process.env.DOSYA_API_KEY! });
 
-// Upload a file
-const result = await client.upload.file({
-  workspaceId: "ws_abc123",
-  fileName: "video.mp4",
-  fileSize: 250_000_000,
-  body: fileBuffer,
+const { workspaces } = await client.workspaces.list();
+const workspaceId = workspaces[0].id;
+
+// Upload - small files go up in one request, large files resume part by part
+const { file } = await client.upload.file({
+  workspaceId,
+  fileName: "report.pdf",
+  body: pdfBlob,
   onProgress: (p) => console.log(`${p.percent}%`),
 });
 
-// List files
-const { files } = await client.files.list({
-  workspaceId: "ws_abc123",
-  sort: "newest",
-});
+// List a folder
+const { files, folders } = await client.files.list({ workspaceId, sort: "modified_desc" });
 
-// Download a file
-const stream = await client.download.stream("file_xxx");
+// Get a short-lived download URL
+const { url } = await client.download.getUrl(file.id, { ttl: 600 });
+
+// Share it
+const { link } = await client.files.createShareLink(file.id, { expiresInDays: 7 });
+console.log(link.url);
 ```
 
 ## Authentication
 
-All requests require an API key. Create one from your [dosya.dev dashboard](https://dosya.dev) under **Settings > API Keys**.
+Every request carries an API key (`dos_...`). Create one in the web app under **Settings > API keys**.
 
-```typescript
-const client = new DosyaClient({
-  apiKey: "dos_your_api_key",
-});
-```
+| Scope | Can call |
+|-------|----------|
+| `read` | GET endpoints, download, archive download |
+| `upload` | Upload endpoints and `folders.create` only |
+| `full` | Everything an API key can reach |
 
-API keys support three scopes:
+A key can also be pinned to one workspace. Pinned keys are refused on routes whose workspace cannot be checked up front (for example webhook management, comment writes, share bundles, remote downloads, and team or share-link changes by id); the refusal is a 403 that says so.
 
-| Scope | Permissions |
-|-------|-------------|
-| `full` | Read, write, delete, share — everything |
-| `read` | List, get, download, search |
-| `upload` | Upload files only |
+Some account actions (creating or listing API keys, 2FA, password, sessions) require an interactive login and are not available to API keys, so they are not in this SDK. `client.me.revokeCurrentKey()` is the one key operation a key can perform on itself.
 
 ## Configuration
 
 ```typescript
 const client = new DosyaClient({
-  apiKey: "dos_your_api_key",
-
-  // Custom base URL (default: https://dosya.dev)
-  baseUrl: "https://dosya.dev",
-
-  // Retry configuration
-  retry: {
-    maxRetries: 3,     // default: 3
-    baseDelay: 500,    // default: 500ms
-    maxDelay: 30_000,  // default: 30s
-  },
-
-  // Rate limit callback
-  onRateLimit: (info) => {
-    console.log(`${info.remaining}/${info.limit} requests left`);
-  },
-
-  // Custom fetch implementation (for testing or proxies)
-  fetch: customFetch,
+  apiKey: "dos_...",
+  baseUrl: "https://api.dosya.dev",   // default
+  timeout: 30_000,                    // per attempt, JSON requests
+  uploadTimeout: 600_000,             // per attempt, requests that carry file bytes
+  retry: { maxRetries: 3, baseDelay: 500, maxDelay: 30_000 },
+  readYourWrites: true,               // echo X-D1-Bookmark so reads see your writes
+  onRateLimit: (info) => console.log(`${info.remaining}/${info.limit} left`),
+  debug: (msg) => console.debug(msg),
+  fetch: customFetch,                 // tests, proxies
 });
 ```
 
-## Resources
+### Retries
 
-### Files
+- GET, HEAD, PUT and DELETE are retried on 5xx, timeouts and network errors, with exponential backoff.
+- POST and PATCH are only retried on a rate-limit 429 carrying `Retry-After`, which the API sends before any work is done. Otherwise a failed POST is never replayed, so it cannot create a duplicate share link, webhook or download job.
+- A 429 without `Retry-After` is a business limit (for example "Daily limit of 20 remote downloads") and is surfaced immediately.
+- If `Retry-After` asks for longer than `maxDelay`, the error is thrown with `err.retryAfter` set instead of sleeping.
+- Uploads manage their own retries: before repeating an upload whose outcome was not seen, the SDK asks the server how the first attempt ended, so a file is never stored twice.
 
-```typescript
-// List files in a workspace
-const { files, folders, pagination } = await client.files.list({
-  workspaceId: "ws_abc",
-  folderId: "folder_123",      // optional — root if omitted
-  filter: "images",            // "all" | "documents" | "videos" | "images"
-  sort: "newest",              // "newest" | "oldest" | "name_asc" | "name_desc" | "largest" | "smallest"
-  q: "quarterly report",      // search within folder
-  page: 1,
-  perPage: 50,
-});
-
-// Get file metadata
-const { file } = await client.files.get("file_xxx");
-
-// Rename
-await client.files.rename("file_xxx", "new-name.pdf");
-
-// Move to another folder
-await client.files.move("file_xxx", "folder_456");
-
-// Copy
-const { file: copy } = await client.files.copy("file_xxx", {
-  newName: "copy-of-report.pdf",
-  folderId: "folder_456",
-});
-
-// Delete (first call = soft delete, second call = permanent)
-const { permanent } = await client.files.delete("file_xxx");
-
-// Restore a soft-deleted file
-await client.files.restore("file_xxx");
-
-// Lock / unlock
-await client.files.lock("file_xxx", { lockMode: "view_only" });
-await client.files.unlock("file_xxx");
-
-// Hide from non-admins
-await client.files.hide("file_xxx", {
-  hiddenMode: "everyone",
-});
-```
-
-### File Versions
+## Uploads
 
 ```typescript
-// List all versions
-const { versions, currentVersion } = await client.files.listVersions("file_xxx");
-
-// Restore a previous version
-await client.files.restoreVersion("file_xxx", 2);
-```
-
-### Upload
-
-The SDK automatically selects the right upload strategy:
-- **Files <= 10 MB**: Single PUT request
-- **Files > 10 MB**: Chunked multipart upload (10 MB parts, 3 concurrent)
-
-```typescript
-import { readFile } from "fs/promises";
-
-const buffer = await readFile("./video.mp4");
-
-const result = await client.upload.file({
-  workspaceId: "ws_abc",
-  fileName: "video.mp4",
-  fileSize: buffer.byteLength,
-  mimeType: "video/mp4",
-  region: "eu-central-1",     // optional — uses workspace default
-  folderId: "folder_123",     // optional — root if omitted
-  body: buffer,
-  onProgress: (p) => {
-    console.log(`${p.status}: ${p.percent}% (${p.partsCompleted}/${p.totalParts})`);
-  },
+// Files: fileSize defaults to the body's size
+await client.upload.file({
+  workspaceId,
+  folderId: "fld_...",
+  fileName: "clip.mp4",
+  body: file,                         // File, Blob, ArrayBuffer, Uint8Array or ReadableStream
+  sourceModifiedAt: file.lastModified / 1000,
+  computeSha256: true,                // verified by the server on single-request uploads
+  expectedVersion: 3,                 // 409 version_conflict if someone else wrote first
+  concurrency: 4,
   abortSignal: controller.signal,
 });
-
-console.log(result.file.id);   // "file_xxx"
-console.log(result.sessionId); // "upl_xxx"
 ```
 
-#### Upload a new version
+- Files up to 50 MiB are sent in one request; larger files use resumable 10 MiB parts. Parts are read with `Blob.slice`, so a multi-GB file is never held in memory.
+- Uploading a name that already exists in the folder creates a new version of that file.
+- The stored MIME type is derived from the file extension.
+
+Resume after a crash with the session id from `DosyaUploadError.sessionId`:
 
 ```typescript
-await client.upload.file({
-  workspaceId: "ws_abc",
-  fileName: "video-v2.mp4",
-  fileSize: buffer.byteLength,
-  fileId: "file_xxx",  // existing file ID — creates a new version
-  body: buffer,
+await client.upload.resume(sessionId, file, { onProgress });
+```
+
+Many small files in few requests:
+
+```typescript
+const results = await client.upload.many({
+  workspaceId,
+  files: localFiles.map((f) => ({ name: f.name, body: f, folderId })),
+  onProgress: (p) => console.log(`${p.filesCompleted}/${p.totalFiles}`),
 });
+for (const r of results) if (!r.ok) console.warn(r.name, r.error);
 ```
 
-#### Resume a failed upload
+`many()` packs files up to 5 MiB into `upload.batch()` requests (up to 200 files each) and sends larger files through `upload.file()`. It reports per-file failures in the results instead of throwing. `upload.batch()`, `upload.init()`, `uploadPart()`, `complete()` and `status()` are available for custom pipelines.
+
+## Downloads
 
 ```typescript
-// Upload was interrupted — resume from where it left off
-const result = await client.upload.resume("upl_session_id", buffer, {
-  onProgress: (p) => console.log(`Resuming: ${p.percent}%`),
+const { url, expiresAt } = await client.download.getUrl(fileId, { ttl: 3600 });
+const bytes = await client.download.arrayBuffer(fileId);
+const stream = await client.download.stream(fileId, { range: { start: 0, end: 1023 } });
+const thumb = await client.download.thumbnail(fileId, { width: 512 });   // Response
+const zip = await client.download.archive({ folderIds: ["fld_..."] });   // streamed Response
+```
+
+Password-locked (`full_lock`) items need an unlock token first:
+
+```typescript
+const { unlockToken } = await client.files.unlock(fileId, "secret");
+await client.download.arrayBuffer(fileId, { unlockToken });
+```
+
+## Sharing
+
+```typescript
+const { link } = await client.files.createShareLink(fileId, {
+  expiresInDays: 14,
+  password: "at-least-8-chars",
+  maxDownloads: 50,
 });
+
+// Private link: only these recipients can open it, after an emailed code
+await client.folders.createShareLink(folderId, {
+  accessMode: "restricted",
+  recipientEmails: ["client@example.com"],
+});
+
+const { sent, failed } = await client.files.shareByEmail(fileId, { emails: ["a@example.com"] });
+
+await client.shares.update(link.id, { maxDownloads: 100 });
+const stats = await client.shares.analytics(link.id, { range: 30 });
+await client.shares.revoke(link.id);
 ```
 
-#### Check upload status
+## Webhooks
 
 ```typescript
-const status = await client.upload.status("upl_session_id");
-// { status: "uploading", bytesUploaded: 31457280, uploadedParts: [1, 2, 3], ... }
+const { webhook } = await client.webhooks.create({
+  workspaceId,
+  url: "https://example.com/hooks/dosya",
+  events: ["file.uploaded", "file.deleted", "share.accessed"],
+});
+// webhook.secret is shown only here and by rollSecret()
 ```
 
-#### Progress callback shape
+Verify deliveries on your server with the raw request body. The helpers have no dependency on the client and use WebCrypto, so they run on Node, Workers, Deno and Bun:
 
 ```typescript
-interface UploadProgress {
-  bytesUploaded: number;
-  totalBytes: number;
-  percent: number;           // 0–100
-  partsCompleted?: number;   // multipart only
-  totalParts?: number;       // multipart only
-  status: "initializing" | "uploading" | "completing" | "complete";
+import { constructWebhookEvent } from "dosyadev/webhooks";
+
+export async function POST(request: Request) {
+  const event = await constructWebhookEvent({
+    payload: await request.text(),
+    header: request.headers.get("X-Dosya-Signature"),
+    secret: process.env.DOSYA_WEBHOOK_SECRET!,
+  });
+  if (event.type === "file.uploaded") console.log(event.data.file_id);
+  return new Response("ok");
 }
 ```
 
-#### Supported input types
+Event payloads arrive exactly as documented (snake_case). `X-Dosya-Event-Id` is stable across retries; use it to deduplicate. `share.accessed` payloads include the share token, so treat webhook bodies as secrets.
 
-| Type | Environment |
-|------|-------------|
-| `ArrayBuffer` | Node.js, Browser |
-| `Uint8Array` | Node.js, Browser |
-| `File` | Browser |
-| `Blob` | Browser |
-| `ReadableStream<Uint8Array>` | Node.js 18+, Browser |
-
-### Download
+## Errors
 
 ```typescript
-// Get a presigned download URL (valid ~1 hour)
-const url = await client.download.getUrl("file_xxx");
-
-// Download as ArrayBuffer
-const buffer = await client.download.arrayBuffer("file_xxx");
-
-// Download as a stream
-const stream = await client.download.stream("file_xxx");
-
-// Download a specific version
-const url = await client.download.getUrl("file_xxx", { version: 2 });
-
-// Get raw inline content (for previews)
-const response = await client.download.raw("file_xxx");
-```
-
-### Folders
-
-```typescript
-// Create a folder (supports nested paths like "a/b/c")
-const { folder, createdCount } = await client.folders.create({
-  workspaceId: "ws_abc",
-  name: "Reports/2025/Q1",
-  parentId: "folder_parent",   // optional
-});
-
-// Get folder metadata
-const { folder } = await client.folders.get("folder_xxx");
-
-// Rename
-await client.folders.rename("folder_xxx", "New Name");
-
-// Move
-await client.folders.move("folder_xxx", "folder_new_parent");
-
-// Delete (cascading — files inside are soft-deleted)
-const { filesAffected, foldersRemoved } = await client.folders.delete("folder_xxx");
-
-// Get full folder tree
-const { folders } = await client.folders.tree("ws_abc");
-
-// Lock / unlock
-await client.folders.lock("folder_xxx", { lockMode: "full_lock" });
-await client.folders.unlock("folder_xxx");
-```
-
-### Sharing
-
-```typescript
-// Create a share link for a file
-const { link } = await client.files.createShareLink("file_xxx", {
-  expiresInDays: 7,
-  password: "secret",
-  lockMode: "view_only",
-});
-console.log(link.token); // share token
-
-// Get existing share links
-const { links } = await client.files.getShareLinks("file_xxx");
-
-// Share via email
-await client.files.shareByEmail("file_xxx", {
-  emails: ["team@example.com"],
-  message: "Here's the latest report",
-});
-
-// Share multiple files as a bundle
-const { link } = await client.files.createShareBundle({
-  fileIds: ["file_1", "file_2", "file_3"],
-  expiresInDays: 30,
-});
-
-// List all share links in a workspace
-const { links, stats } = await client.shares.list("ws_abc");
-
-// Revoke a share link
-await client.shares.revoke("link_xxx");
-```
-
-### Workspaces
-
-```typescript
-// List workspaces
-const { workspaces } = await client.workspaces.list();
-
-// Get workspace details
-const { workspace, settings, isOwner } = await client.workspaces.get("ws_abc");
-
-// Create a workspace
-const { workspace } = await client.workspaces.create({
-  name: "My Team",
-  defaultRegion: "eu-central-1",
-});
-
-// Update workspace
-await client.workspaces.update("ws_abc", {
-  name: "New Name",
-  iconColor: "#22c55e",
-});
-
-// Update workspace settings
-await client.workspaces.updateSettings("ws_abc", {
-  maxFileSizeGb: 5,
-  blockedExtensions: ".exe,.bat",
-  forceSharePassword: 1,
-});
-
-// Delete workspace
-await client.workspaces.delete("ws_abc");
-```
-
-### File Requests
-
-Create upload links that external users can use to send you files.
-
-```typescript
-// Create a file request
-const { request } = await client.fileRequests.create({
-  workspaceId: "ws_abc",
-  title: "Please upload your documents",
-  message: "Upload your signed contracts here",
-  expiresInDays: 14,
-  maxFiles: 10,
-  maxFileSizeMb: 100,
-  emails: ["client@example.com"],
-});
-console.log(request.url); // shareable upload link
-
-// Get request details
-const { request } = await client.fileRequests.get("req_xxx");
-
-// List received uploads
-const { uploads } = await client.fileRequests.listUploads("req_xxx");
-
-// Resend invitation emails
-await client.fileRequests.resend("req_xxx");
-
-// Delete a file request
-await client.fileRequests.delete("req_xxx");
-```
-
-### Search
-
-```typescript
-const results = await client.search.query({
-  workspaceId: "ws_abc",
-  q: "quarterly report",
-  page: 1,
-  perPage: 20,
-});
-
-// Results include files, folders, share links, and file requests
-console.log(results.files);
-console.log(results.folders);
-console.log(results.shared);
-console.log(results.fileRequests);
-```
-
-### Comments
-
-```typescript
-// List comments on a file
-const { comments } = await client.comments.list({
-  workspaceId: "ws_abc",
-  fileId: "file_xxx",
-});
-
-// Add a comment
-const { comment } = await client.comments.create({
-  workspaceId: "ws_abc",
-  fileId: "file_xxx",
-  body: "Looks good, approved!",
-});
-
-// Reply to a comment
-await client.comments.create({
-  workspaceId: "ws_abc",
-  fileId: "file_xxx",
-  parentId: comment.id,
-  body: "Thanks!",
-});
-
-// Edit a comment
-await client.comments.edit("comment_xxx", "Updated text");
-
-// Delete a comment
-await client.comments.delete("comment_xxx");
-```
-
-### Activity Log
-
-```typescript
-const { activities, members, pagination } = await client.activity.list({
-  workspaceId: "ws_abc",
-  category: "files",       // optional filter
-  action: "file_uploaded", // optional filter
-  userId: "user_xxx",      // optional filter
-  page: 1,
-  perPage: 50,
-});
-```
-
-### User Profile & API Keys
-
-```typescript
-// Get current user
-const { user } = await client.me.profile();
-
-// List API keys
-const { keys } = await client.me.listApiKeys();
-
-// Create a new API key
-const { key } = await client.me.createApiKey({
-  name: "CI/CD Pipeline",
-  scope: "upload",
-  expiresInDays: 90,
-});
-console.log(key.plainKey); // only shown once
-
-// Delete an API key
-await client.me.deleteApiKey("key_xxx");
-```
-
-## Error Handling
-
-All errors extend `DosyaError` for easy catching.
-
-```typescript
-import { DosyaApiError, DosyaNetworkError, DosyaUploadError } from "dosyadev";
+import { DosyaApiError, DosyaNetworkError, DosyaTimeoutError, DosyaUploadError } from "dosyadev";
 
 try {
-  await client.files.get("file_xxx");
+  await client.files.list({ workspaceId, folderId });
 } catch (err) {
   if (err instanceof DosyaApiError) {
-    // Server returned { ok: false, error: "..." }
-    console.log(err.status);        // 404
-    console.log(err.errorMessage);  // "File not found"
-  }
-
-  if (err instanceof DosyaNetworkError) {
-    // fetch() failed (timeout, DNS, offline)
-    console.log(err.cause);
-  }
-
-  if (err instanceof DosyaUploadError) {
-    // Upload-specific failure
-    console.log(err.sessionId);   // "upl_xxx"
-    console.log(err.partNumber);  // 5 (which part failed)
+    err.status;        // 403
+    err.errorMessage;  // the API's message
+    err.code;          // machine code when present: "folder_locked", "version_conflict", "quota", ...
+    err.details;       // extra fields, e.g. { folder_id, lock_mode }
+    err.retryAfter;    // seconds, when the API sent Retry-After
+  } else if (err instanceof DosyaTimeoutError) {
+    err.timeoutMs;
+  } else if (err instanceof DosyaNetworkError) {
+    err.cause;
+  } else if (err instanceof DosyaUploadError) {
+    err.sessionId;     // pass to upload.resume()
+    err.partNumber;
   }
 }
 ```
 
-## API Reference
+## Things worth knowing
 
-### All Resources & Methods
+- **Deleting is two-stage.** `files.delete()` and `folders.delete()` move an item to the trash; calling delete again on a trashed item removes it permanently. Neither is retried automatically. Use `folders.purge()` to empty a trashed folder completely.
+- **Unlock does not remove a lock.** `unlock(id, password)` grants one hour of access to a `full_lock` item. Remove a lock with `lock(id, { lockMode: "none" })`.
+- **Deleting a workspace needs a person.** Call `workspaces.requestDeletion(id)`, read the 6-digit code from the owner's email, then `workspaces.delete(id, { code, confirmName })`.
+- **A workspace's region is fixed at creation.** List valid codes with `client.regions.list()`.
+- **Addresses at dosya.dev** are refused as share and file-request recipients (400) unless the sender is also a dosya.dev account.
 
-| Resource | Method | Description |
-|----------|--------|-------------|
-| **files** | `list(params)` | List files and folders |
-| | `get(fileId)` | Get file metadata |
-| | `delete(fileId)` | Soft/permanent delete |
-| | `restore(fileId)` | Restore soft-deleted file |
-| | `rename(fileId, name)` | Rename a file |
-| | `move(fileId, folderId)` | Move to folder |
-| | `copy(fileId, options?)` | Copy a file |
-| | `lock(fileId, params)` | Lock a file |
-| | `unlock(fileId)` | Unlock a file |
-| | `hide(fileId, params?)` | Hide from non-admins |
-| | `listVersions(fileId)` | Get version history |
-| | `restoreVersion(fileId, version)` | Restore a version |
-| | `getShareLinks(fileId)` | Get share links |
-| | `createShareLink(fileId, params?)` | Create share link |
-| | `shareByEmail(fileId, params)` | Share via email |
-| | `createShareBundle(params)` | Share multiple files |
-| **folders** | `create(params)` | Create folder(s) |
-| | `get(folderId)` | Get folder metadata |
-| | `rename(folderId, name)` | Rename folder |
-| | `delete(folderId)` | Delete folder |
-| | `move(folderId, parentId)` | Move folder |
-| | `tree(workspaceId)` | Get folder tree |
-| | `lock(folderId, params)` | Lock folder |
-| | `unlock(folderId)` | Unlock folder |
-| **upload** | `file(params)` | Upload a file (auto chunked) |
-| | `resume(sessionId, body, options?)` | Resume failed upload |
-| | `init(params)` | Initialize upload session |
-| | `status(sessionId)` | Check upload progress |
-| **download** | `getUrl(fileId, options?)` | Get presigned URL |
-| | `arrayBuffer(fileId, options?)` | Download as buffer |
-| | `stream(fileId, options?)` | Download as stream |
-| | `raw(fileId, options?)` | Get inline content |
-| **shares** | `list(workspaceId)` | List all share links |
-| | `revoke(linkId)` | Revoke a share link |
-| **workspaces** | `list()` | List workspaces |
-| | `get(workspaceId)` | Get workspace details |
-| | `create(params)` | Create workspace |
-| | `update(workspaceId, params)` | Update workspace |
-| | `updateSettings(workspaceId, settings)` | Update settings |
-| | `delete(workspaceId)` | Delete workspace |
-| **fileRequests** | `create(params)` | Create file request |
-| | `get(requestId)` | Get request details |
-| | `update(requestId, params)` | Update request |
-| | `delete(requestId)` | Delete request |
-| | `listUploads(requestId)` | List received uploads |
-| | `listRecipients(requestId)` | List recipients |
-| | `resend(requestId, recipientIds?)` | Resend invitations |
-| **search** | `query(params)` | Search everything |
-| **comments** | `list(params)` | List comments |
-| | `create(params)` | Add comment |
-| | `edit(commentId, body)` | Edit comment |
-| | `delete(commentId)` | Delete comment |
-| **activity** | `list(params)` | Activity log |
-| **me** | `profile()` | Get current user |
-| | `listApiKeys()` | List API keys |
-| | `createApiKey(params)` | Create API key |
-| | `deleteApiKey(keyId)` | Delete API key |
+## API reference
+
+| Resource | Methods |
+|----------|---------|
+| **files** | `list`, `get`, `delete`, `restore`, `rename`, `move`, `copy`, `getLock`, `lock`, `unlock`, `getHide`, `hide`, `listVersions`, `restoreVersion`, `getShareLinks`, `createShareLink`, `shareByEmail`, `createShareBundle`, `batchDelete`, `duplicates` |
+| **folders** | `create`, `createBatch`, `get`, `rename`, `restore`, `delete`, `purge`, `move`, `tree`, `children`, `search`, `getLock`, `lock`, `unlock`, `getHide`, `hide`, `getShareLinks`, `createShareLink`, `shareByEmail` |
+| **upload** | `file`, `resume`, `many`, `batch`, `init`, `uploadPart`, `complete`, `status` |
+| **download** | `getUrl`, `arrayBuffer`, `blob`, `stream`, `raw`, `thumbnail`, `archive`, `archiveEntries`, `archiveEntry` |
+| **favourites** | `list`, `add`, `remove` |
+| **shares** | `list`, `update`, `analytics`, `revoke`, `withMe` |
+| **workspaces** | `list`, `get`, `create`, `update`, `getSettings`, `updateSettings`, `uploadLimits`, `deletePreview`, `requestDeletion`, `delete`, `transfer`, `leave` |
+| **team** | `list`, `invite`, `resendInvite`, `revokeInvite`, `updateMember`, `removeMember`, `listInviteLinks`, `createInviteLink`, `revokeInviteLink` |
+| **roles** | `list`, `create`, `update`, `delete` |
+| **regions** | `list` |
+| **fileRequests** | `list`, `create`, `get`, `update`, `delete`, `listUploads`, `listRecipients`, `addRecipient`, `removeRecipient`, `resend` |
+| **search** | `query` (supports an `ext:pdf` token) |
+| **comments** | `list`, `create`, `edit`, `delete` |
+| **activity** | `list` |
+| **webhooks** | `list`, `create`, `get`, `update`, `delete`, `rollSecret`, `test`, `listDeliveries`, `redeliver` |
+| **remoteDownloads** | `list`, `create`, `cancel`, `waitFor` |
+| **me** | `profile`, `permissions`, `updateName`, `revokeCurrentKey` |
+
+Every method has JSDoc with its key scope, permission and limits; your editor shows it on hover.
+
+Upgrading from 0.1.0? See [CHANGELOG.md](CHANGELOG.md) for the breaking changes.
 
 ## Requirements
 
-- **Node.js** >= 18 (uses native `fetch`)
-- **Browsers**: All modern browsers with `fetch` support
-- **TypeScript** >= 5.0 (optional — works with plain JavaScript too)
+- **Node.js** >= 18 (native `fetch`)
+- **Browsers**: any modern browser with `fetch`
+- **TypeScript** >= 5.0 (optional)
 
 ## License
 
-[MIT](LICENSE) — the SDK is free to embed in your own applications. It talks to the
+[MIT](LICENSE) - the SDK is free to embed in your own applications. It talks to the
 official [dosya.dev](https://dosya.dev) service.
 
 ## Security
@@ -558,7 +268,7 @@ public issue.
 
 | Repository | What it is | License |
 |---|---|---|
-| [desktop](https://github.com/dosya-dev/desktop) | Desktop client — sync, upload, manage | Source-available |
+| [desktop](https://github.com/dosya-dev/desktop) | Desktop client - sync, upload, manage | Source-available |
 | [cli](https://github.com/dosya-dev/cli) | Command-line interface | Source-available |
 | [app.dosya.dev](https://github.com/dosya-dev/app.dosya.dev) | Web application | Source-available |
 | [shared](https://github.com/dosya-dev/shared) | Shared TypeScript types & utilities | Source-available |
